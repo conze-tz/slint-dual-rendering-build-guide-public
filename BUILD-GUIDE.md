@@ -179,6 +179,12 @@ git clone -b walnascar https://github.com/kraj/meta-clang
 > `clang-cross-${TARGET_ARCH}`. Without it the build fails at dependency
 > resolution with `Nothing PROVIDES 'clang-cross-aarch64'`.
 
+> `meta-rust-bin` provides the prebuilt Rust toolchain, but it ships **no
+> bare-metal `std`/`core` for the `thumbv7em-none-eabihf` target** used by the
+> M7 firmware. The SDK pulls that in itself (see the
+> `can't find crate for 'core'` troubleshooting entry); after a Rust version
+> bump you may need to add a new hash.
+
 Verify each is walnascar-compatible:
 
 ```sh
@@ -273,8 +279,24 @@ bundle).
 
 ## Step 9 — Locate the provisioning bundle
 
+The bundle is written to `${DEPLOY_DIR_IMAGE}/slint-dual-render-bundle-${MACHINE}/`.
+The exact location of `DEPLOY_DIR_IMAGE` depends on your `TMPDIR` setting:
+
+- Default Yocto layout: `~/verdin-bsp/build/tmp/deploy/images/verdin-imx95/...`
+- Some BSP configurations (a custom `TMPDIR`) put it directly under
+  `~/verdin-bsp/build/deploy/images/verdin-imx95/...` — **without** the `tmp/`
+  segment.
+
+If the path you expect is missing, locate it instead of guessing:
+
 ```sh
-ls -la ~/verdin-bsp/build/tmp/deploy/images/verdin-imx95/slint-dual-render-bundle-verdin-imx95/
+find ~/verdin-bsp/build -type d -name "slint-dual-render-bundle-verdin-imx95" 2>/dev/null
+```
+
+Then list the bundle:
+
+```sh
+ls -la <bundle-dir-from-find>/
 ```
 
 Contents:
@@ -289,6 +311,22 @@ Contents:
 | `tezi-load.lst` | |
 | `README.md` | Its stated md5 matches `part0 ‖ part1` |
 
+### Bundle missing even though the build reported "all succeeded"
+
+The `do_provisioning_bundle` task writes the bundle directly into
+`DEPLOY_DIR_IMAGE` and is **not** sstate-cached. If `tmp/deploy` (or `deploy`)
+was cleaned after a build, or bitbake decided there was "nothing to do", the
+bundle directory can be absent while the main image tasks still show as
+successful. Force the bundle task to re-run by invalidating everything from
+`do_image_complete` onward:
+
+```sh
+cd ~/verdin-bsp/build
+bitbake -C image_complete slint-dual-render-image
+```
+
+Then re-check with the `find` command above.
+
 ---
 
 ## Step 10 — Flash with `uuu`
@@ -298,13 +336,19 @@ block counts are computed from the real artifact sizes; a stale copy writes
 past the end of the image.
 
 ```sh
-cd ~/verdin-bsp/build/tmp/deploy/images/verdin-imx95/slint-dual-render-bundle-verdin-imx95/
+cd <bundle-dir-from-find>/
+cat README.md          # exact uuu steps + expected WIC md5
 sudo uuu emmc-provision.lst
 ```
 
 Enter recovery mode first: hold the **RECOVERY** button through a **cold
 power-on** (unplug and replug the supply), not a reset. Board USB IDs:
 `1fc9:015d` (ROM), `1b67:4059` (U-Boot).
+
+> **WSL note:** run `uuu` **inside** WSL, not from Windows via the
+> `\\wsl.localhost\...` path. `uuu` needs direct USB access; attach the board's
+> USB device to WSL with `usbipd` (`usbipd list`, then `usbipd attach --wsl
+> --busid <id>`) before the Verdin becomes visible in recovery mode.
 
 After flashing:
 - **Power-cycle** the board (unplug/replug) — U-Boot may otherwise come up in
@@ -380,6 +424,100 @@ ls ~/verdin-bsp/build/tmp/work-shared/verdin-imx95/kernel-source/arch/arm64/boot
 ```
 
 If other DTBs are missing too, add them to the same `:remove` line.
+
+### Build (M7): `can't find crate for 'core'` / thumbv7em std missing
+
+The M7 firmware cross-compiles the Slint SafeUI core for
+`thumbv7em-none-eabihf`. `meta-rust-bin` ships no `std`/`core` for that
+bare-metal target, so the SDK pulls it in via
+`meta-slint-dual-rendering/recipes-devtools/rust/rust-bin-cross_%.bbappend`,
+keyed by Rust version in the `SLINT_M7_RUST_STD_HASHES` table. After a
+walnascar Rust bump the current version won't be in the table and the M7 build
+fails with `can't find crate for 'core'` (and `do_configure` warns that the
+`thumbv7em-none-eabihf` Rust standard library was not found).
+
+First determine the Rust version in use:
+
+```sh
+cd ~/verdin-bsp/build
+RUSTVER=$(bitbake -e rust-bin-cross-aarch64 | sed -n 's/^PV="\(.*\)"/\1/p')
+echo "$RUSTVER"
+```
+
+Then compute the two hashes for that version's thumbv7em `rust-std` tarball
+(md5 locally, sha256 from rust-lang's published checksum):
+
+```sh
+URL="https://static.rust-lang.org/dist/rust-std-${RUSTVER}-thumbv7em-none-eabihf.tar.gz"
+curl -sL "$URL" -o /tmp/rust-std-m7.tar.gz
+MD5=$(md5sum /tmp/rust-std-m7.tar.gz | awk '{print $1}')
+SHA256=$(curl -sL "${URL}.sha256" | awk '{print $1}')
+echo "SLINT_M7_RUST_STD_HASHES[${RUSTVER}] = \"${MD5} ${SHA256}\""
+```
+
+The printed line is in the exact format the table expects — an md5 (32 chars),
+a single space, then a sha256 (64 chars), in quotes. Paste it below the
+existing entries in
+`meta-slint-dual-rendering/recipes-devtools/rust/rust-bin-cross_%.bbappend`,
+for example:
+
+```
+SLINT_M7_RUST_STD_HASHES[1.96.0] = "<md5> <sha256>"
+SLINT_M7_RUST_STD_HASHES[1.98.1] = "<md5> <sha256>"
+```
+
+Verify the hash is picked up (the SRC_URI should now include the
+`rust-std-<ver>-thumbv7em-none-eabihf.tar.gz` entry), then rebuild:
+
+```sh
+bitbake -e rust-bin-cross-aarch64 | grep "rust-std-${RUSTVER}-thumbv7em"
+bitbake -c cleansstate rust-bin-cross-aarch64
+bitbake -c cleansstate slint-dual-render-m7
+bitbake slint-dual-render-image
+```
+
+### Build (M7): `Unable to find libclang` (bindgen panics)
+
+The SafeUI core runs `bindgen` to generate FFI bindings, which needs
+`libclang.so` at build time. If the M7 recipe lacks `clang-native` and
+`LIBCLANG_PATH`, bindgen panics with
+`Unable to find libclang: "couldn't find any valid shared libraries ..."`.
+
+In `meta-slint-dual-rendering/recipes-slint/slint-dual-render-m7/slint-dual-render-m7_git.bb`
+add `clang-native` to `DEPENDS`:
+
+```
+DEPENDS += "gcc-arm-none-eabi-native cmake-native clang-native"
+```
+
+and, inside `do_compile`, export the native lib directory as a plain shell
+variable (alongside the other `export` lines in that function):
+
+```sh
+export LIBCLANG_PATH="${STAGING_LIBDIR_NATIVE}"
+```
+
+> **Watch the spacing.** This export lives inside a shell task, so it must use
+> shell syntax with **no spaces** around `=`. Writing
+> `export LIBCLANG_PATH = "${STAGING_LIBDIR_NATIVE}"` (with spaces, bitbake
+> style) makes the shell parse `=` as a second argument and the task aborts at
+> runtime with `export: : bad variable name`.
+
+Confirm both changes take effect, then rebuild:
+
+```sh
+cd ~/verdin-bsp/build
+bitbake -e slint-dual-render-m7 | grep -E "^export LIBCLANG_PATH=|clang-native"
+bitbake -c cleansstate slint-dual-render-m7
+bitbake slint-dual-render-image
+```
+
+> If bindgen next complains about a missing bare-metal header
+> (e.g. `fatal error: 'stdint.h' file not found`), libclang is now found but
+> lacks the target include path. Set
+> `BINDGEN_EXTRA_CLANG_ARGS_thumbv7em_none_eabihf` (note the **underscores**)
+> inside `do_compile` to point `--target` and `-I` at the
+> `gcc-arm-none-eabi-native` include directory.
 
 ### Build: `No stock boot container ... flash_a55`
 
